@@ -115,6 +115,7 @@ _FAST_MODE_BETA = "fast-mode-2026-02-01"
 _OAUTH_ONLY_BETAS = [
     "claude-code-20250219",
     "oauth-2025-04-20",
+    "context-1m-2025-08-07",
 ]
 
 # Claude Code identity — required for OAuth requests to be routed correctly.
@@ -491,16 +492,30 @@ def build_anthropic_client(api_key: str, base_url: str = None):
         kwargs["auth_token"] = api_key
         kwargs["default_headers"] = {
             "anthropic-beta": ",".join(all_betas),
-            "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+            "User-Agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
             "x-app": "cli",
         }
     else:
-        # Regular API key → x-api-key header + common betas
+        # Regular API key → x-api-key header + common betas + Claude Code identity.
+        # The Claude Code user-agent and x-app headers provide preferential rate
+        # limit treatment on Anthropic's infrastructure.  Without them, direct API
+        # callers hit much tighter per-key limits, especially during capacity
+        # crunches (HTTP 529 Overloaded / 429 Rate Limited).
         kwargs["api_key"] = api_key
-        if common_betas:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
-
-    return _anthropic_sdk.Anthropic(**kwargs)
+        all_betas = list(common_betas) + list(_OAUTH_ONLY_BETAS)
+        kwargs["default_headers"] = {
+            "anthropic-beta": ",".join(all_betas),
+            "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+            "x-app": "cli",
+        }
+    client = _anthropic_sdk.Anthropic(**kwargs)
+    # When using Bearer auth (auth_token), ensure api_key is None so the SDK
+    # does not also send an X-Api-Key header.  The SDK's constructor reads
+    # ANTHROPIC_API_KEY from the environment when api_key is not passed,
+    # which can produce an empty-string api_key that overrides valid OAuth.
+    if kwargs.get("auth_token") and not kwargs.get("api_key"):
+        client.api_key = None
+    return client
 
 
 def read_claude_code_credentials() -> Optional[Dict[str, Any]]:

@@ -216,6 +216,13 @@ class MemPalaceProvider(MemoryProvider):
         return _ensure_mempalace()
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        logger.info(
+            "=" * 60 + "\n"
+            "  MemPalace memory provider ACTIVATED\n"
+            f"  session_id={session_id} wing={self._config.get('wing', 'hermes')}\n"
+            f"  palace_path={os.path.expanduser(self._config.get('palace_path', '~/.mempalace'))}\n"
+            + "=" * 60
+        )
         if not _ensure_mempalace():
             logger.warning("mempalace not installed: pip install mempalace")
             return
@@ -552,10 +559,44 @@ class MemPalaceProvider(MemoryProvider):
 
     # -- Tool handlers --------------------------------------------------------
 
+    def _rebind_if_stale(self) -> None:
+        """Re-bind collection + stack if they went None, or if the palace
+        was rebuilt on disk after plugin init. Cheap no-op when already bound.
+        Works around the init-once/never-rebind lifecycle: if chroma.sqlite3
+        was corrupt (or missing) at session start, _collection and _stack got
+        set to None and stayed None even after the palace was repaired. With
+        this helper, every tool call attempts a lazy re-bind so recovery is
+        possible mid-session without a Hermes restart."""
+        if self._collection is not None and self._stack is not None:
+            return
+        if not _ensure_mempalace():
+            return
+        try:
+            from mempalace.palace import get_collection
+            from mempalace.layers import MemoryStack
+            if self._collection is None:
+                self._collection = get_collection(self._palace_path)
+                logger.info(
+                    f"MemPalace lazy-rebind OK: {self._palace_path} "
+                    f"({self._collection.count()} drawers)"
+                )
+            if self._stack is None:
+                identity_path = self._config.get(
+                    "identity_path",
+                    os.path.expanduser("~/.mempalace/identity.txt"),
+                )
+                self._stack = MemoryStack(
+                    palace_path=self._palace_path,
+                    identity_path=identity_path,
+                )
+        except Exception as e:
+            logger.debug(f"MemPalace lazy-rebind failed: {e}")
+
     def _handle_search(self, args: dict) -> str:
         query = args.get("query", "").strip()
         if not query:
             return tool_error("query is required")
+        self._rebind_if_stale()
         if not self._stack:
             return tool_error("MemPalace not initialized")
 

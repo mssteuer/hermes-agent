@@ -260,7 +260,68 @@ def _infer_provider_from_url(base_url: str) -> Optional[str]:
 
 
 def _is_known_provider_base_url(base_url: str) -> bool:
-    return _infer_provider_from_url(base_url) is not None
+    if _infer_provider_from_url(base_url) is not None:
+        return True
+    # Recognise LiteLLM proxy URLs from custom_providers config.
+    # Without this, localhost:4000 (LiteLLM) gets probed as a local
+    # inference server (Ollama/vLLM/llama.cpp), flooding logs with 401s.
+    return _is_litellm_proxy_url(base_url)
+
+
+def _is_litellm_proxy_url(base_url: str) -> bool:
+    """Return True if base_url matches a custom_providers entry whose name starts with 'litellm'."""
+    if not base_url:
+        return False
+    normalized = _normalize_base_url(base_url)
+    if not normalized:
+        return False
+    try:
+        from agent.credential_pool import _iter_custom_providers
+        for name, entry in _iter_custom_providers():
+            if name.startswith("litellm"):
+                entry_url = _normalize_base_url(str(entry.get("base_url", "")))
+                if entry_url and entry_url == normalized:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+_litellm_base_urls: Optional[frozenset] = None
+
+
+def _is_litellm_base_url(base_url: str) -> bool:
+    """Return True if base_url points to a LiteLLM proxy.
+
+    Checks custom_providers in config.yaml for any entry whose base_url
+    matches AND whose name starts with 'litellm'.  This prevents probing
+    the LiteLLM proxy as if it were a local inference server.
+    Result is cached after first load.
+    """
+    global _litellm_base_urls
+    if not base_url:
+        return False
+    normalized = _normalize_base_url(base_url)
+    if not normalized:
+        return False
+    if _litellm_base_urls is None:
+        urls = set()
+        try:
+            from hermes_cli.config import load_config
+            config = load_config()
+            custom_providers = config.get("custom_providers")
+            if isinstance(custom_providers, list):
+                for entry in custom_providers:
+                    if not isinstance(entry, dict):
+                        continue
+                    name = str(entry.get("name", "")).strip().lower()
+                    cp_url = _normalize_base_url(str(entry.get("base_url", "")))
+                    if name.startswith("litellm") and cp_url:
+                        urls.add(cp_url)
+        except Exception:
+            pass
+        _litellm_base_urls = frozenset(urls)
+    return normalized in _litellm_base_urls
 
 
 def is_local_endpoint(base_url: str) -> bool:
@@ -966,12 +1027,18 @@ def get_model_context_length(
         if cached is not None:
             return cached
 
+    # LiteLLM proxy: treat as a known gateway, not a local inference server.
+    # LiteLLM is an OpenAI-compatible proxy that requires auth — probing it
+    # with /props, /version, /v1/models/<model> without auth floods its logs
+    # with 401 errors.  Skip local server detection entirely for litellm providers.
+    _is_litellm = (provider.startswith("litellm") if provider else False) or _is_litellm_base_url(base_url)
+
     # 2. Active endpoint metadata for truly custom/unknown endpoints.
     # Known providers (Copilot, OpenAI, Anthropic, etc.) skip this — their
     # /models endpoint may report a provider-imposed limit (e.g. Copilot
     # returns 128k) instead of the model's full context (400k).  models.dev
     # has the correct per-provider values and is checked at step 5+.
-    if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url):
+    if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url) and not _is_litellm:
         endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
         matched = endpoint_metadata.get(model)
         if not matched:
@@ -988,7 +1055,7 @@ def get_model_context_length(
             context_length = matched.get("context_length")
             if isinstance(context_length, int):
                 return context_length
-        if not _is_known_provider_base_url(base_url):
+        if not _is_known_provider_base_url(base_url) and not _is_litellm:
             # 3. Try querying local server directly
             if is_local_endpoint(base_url):
                 local_ctx = _query_local_context_length(model, base_url)
@@ -1049,8 +1116,8 @@ def get_model_context_length(
         if default_model in model_lower:
             return length
 
-    # 9. Query local server as last resort
-    if base_url and is_local_endpoint(base_url):
+    # 9. Query local server as last resort (skip for LiteLLM proxy)
+    if base_url and is_local_endpoint(base_url) and not _is_litellm:
         local_ctx = _query_local_context_length(model, base_url)
         if local_ctx and local_ctx > 0:
             save_context_length(model, base_url, local_ctx)
