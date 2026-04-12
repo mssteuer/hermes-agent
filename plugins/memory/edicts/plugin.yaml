@@ -1,0 +1,9 @@
+name: edicts
+version: 1.0.0
+description: "Ground Truth injection — loads ~/workspace/edicts.yaml and injects active edicts into every session as non-negotiable facts."
+config:
+  path: ~/workspace/edicts.yaml
+  token_budget: 4000
+  inject_into: system
+  tools_enabled: true
+  tools_write: false
