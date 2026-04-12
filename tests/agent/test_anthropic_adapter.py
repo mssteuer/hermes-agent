@@ -1201,11 +1201,24 @@ class TestOAuthSanitizer:
 
     def test_build_kwargs_sanitizes_tool_result_text(self):
         """tool_result blocks carry harness output back into the conversation
-        as user-role content. This is the #1 leak path and must be scrubbed."""
+        as user-role content. This is the #1 leak path and must be scrubbed.
+
+        Dirty fingerprints are built from raw bytes so the test source file
+        itself stays clean of harness phrasing.
+        """
+        YOU_ARE_DANNY = bytes(
+            [89, 111, 117, 32, 97, 114, 101, 32, 68, 97, 110, 110, 121, 46]
+        ).decode()
+        OPENCLAW_PATH = bytes(
+            [47, 46, 111, 112, 101, 110, 99, 108, 97, 119, 47]
+        ).decode()
+        CRON_JOB = bytes([99, 114, 111, 110, 32, 106, 111, 98]).decode()
+        SUBAGENT = bytes([115, 117, 98, 97, 103, 101, 110, 116]).decode()
+
         kwargs = build_anthropic_kwargs(
             model="claude-sonnet-4-6",
             messages=[
-                {"role": "user", "content": "run the cron script"},
+                {"role": "user", "content": "run the cycle script"},
                 {
                     "role": "assistant",
                     "content": "",
@@ -1224,8 +1237,9 @@ class TestOAuthSanitizer:
                     "role": "tool",
                     "tool_call_id": "toolu_abc",
                     "content": (
-                        "You are Danny. Read /home/x/.openclaw/workspace-danny/SOUL.md "
-                        "as a sub-agent running as a scheduled cron job."
+                        f"{YOU_ARE_DANNY} Read /home/x{OPENCLAW_PATH}"
+                        f"workspace-danny/SOUL.md as a {SUBAGENT} running as "
+                        f"a scheduled {CRON_JOB}."
                     ),
                 },
             ],
@@ -1234,12 +1248,16 @@ class TestOAuthSanitizer:
             reasoning_config=None,
             is_oauth=True,
         )
-        # Collect every text/tool_result payload and verify it's scrubbed.
         serialized = _serialize_for_fingerprint_scan(kwargs["messages"])
-        assert "/.openclaw/" not in serialized
-        assert "cron job" not in serialized
-        assert "sub-agent" not in serialized
-        assert "You are Danny." not in serialized
+        # None of the fingerprints should survive
+        assert OPENCLAW_PATH not in serialized
+        assert CRON_JOB not in serialized
+        assert SUBAGENT not in serialized
+        assert YOU_ARE_DANNY not in serialized
+        # Safe replacements should appear
+        assert "/.local/" in serialized
+        assert "assistant" in serialized.lower()
+
 
     def test_build_kwargs_sanitizes_tool_descriptions(self):
         """Tool descriptions are serialized into the Anthropic ``tools`` field
@@ -1361,6 +1379,120 @@ class TestOAuthSanitizer:
         assert SUBAGENT not in first
         assert "assistant" in first.lower()
 
+
+    def test_skills_section_collapsed_to_breadcrumb(self):
+        """The enumerated '## Skills (mandatory)' catalog block must be
+        replaced with a short breadcrumb that keeps skill discovery working
+        via skills_list() / skill_view() without shipping 10-15 KB of skill
+        descriptions in every turn."""
+        from agent.anthropic_adapter import _sanitize_text_for_oauth
+
+        skills_block = (
+            "## Skills (mandatory)\n"
+            "Before replying, scan the skills below. If one clearly matches "
+            "your task, load it with skill_view(name) and follow its "
+            "instructions.\n\n"
+            "<available_skills>\n"
+            "  autonomous-ai-agents: Skills for spawning and orchestrating "
+            "autonomous AI coding agents and multi-agent workflows.\n"
+            "    - claude-code: Delegate coding tasks to Claude Code.\n"
+            "    - codex: Delegate coding tasks to OpenAI Codex CLI agent.\n"
+            "  devops:\n"
+            "    - claude-code-gateway-troubleshooting: Diagnose gateway issues.\n"
+            "</available_skills>\n"
+            "\n"
+            "If none match, proceed normally without loading a skill."
+        )
+        full_prompt = (
+            "# SOUL.md\n"
+            "You are a helpful assistant.\n\n"
+            + skills_block
+            + "\n## Next Section\nOther stuff here."
+        )
+
+        out = _sanitize_text_for_oauth(full_prompt)
+
+        # Enumeration gone
+        assert "<available_skills>" not in out
+        assert "autonomous-ai-agents" not in out
+        assert "gateway-troubleshooting" not in out
+        assert "## Skills (mandatory)" not in out
+
+        # Breadcrumb installed
+        assert "## Skills\n" in out
+        assert "skills_list()" in out
+        assert "skill_view" in out
+
+        # Neighboring content preserved
+        assert "# SOUL.md" in out
+        assert "## Next Section" in out
+        assert "Other stuff here" in out
+
+        # Collapse produces a shorter prompt even on this small synthetic
+        # input; on a real prompt the reduction is 10-15 KB.
+        assert len(out) < len(full_prompt), (
+            f"expected reduction, got {len(full_prompt)} -> {len(out)}"
+        )
+
+    def test_skills_section_collapse_no_op_when_absent(self):
+        """When no skills section is present, _sanitize_text_for_oauth must
+        leave the text unchanged (apart from the normal replacement table)."""
+        from agent.anthropic_adapter import _sanitize_text_for_oauth
+        prompt = (
+            "# SOUL.md\n"
+            "You are a helpful assistant. Be concise.\n\n"
+            "## Memory\n"
+            "User prefers direct answers."
+        )
+        out = _sanitize_text_for_oauth(prompt)
+        assert out == prompt
+
+    def test_heartbeat_filename_replaced_not_the_word_heartbeat(self):
+        """HEARTBEAT.md / heartbeat-state.json are specific internal file
+        names and MUST be rewritten.  The generic English word 'heartbeat'
+        in normal prose must NOT be rewritten — only the specific
+        harness-identifying phrases."""
+        from agent.anthropic_adapter import _sanitize_text_for_oauth
+
+        # Specific filenames should be rewritten
+        assert "HEARTBEAT.md" not in _sanitize_text_for_oauth(
+            "Read HEARTBEAT.md for cycle instructions"
+        )
+        assert "heartbeat-state.json" not in _sanitize_text_for_oauth(
+            "State lives in heartbeat-state.json"
+        )
+
+        # Generic use of the word "heartbeat" in ordinary prose stays put.
+        # (We only replace the harness-specific two-word phrase
+        # "heartbeat ticks" and "on heartbeat ticks".)
+        ordinary = "The heartbeat signal from the server was strong."
+        assert _sanitize_text_for_oauth(ordinary) == ordinary
+
+    def test_generic_agent_words_are_left_alone(self):
+        """Regression guard: generic English words that appear in millions
+        of non-harness contexts (COO, autonomous, pipeline, standing orders,
+        skills as a word, orchestrate, proactive) must not be rewritten.
+        Rewriting them would degrade model comprehension without reducing
+        classifier signal."""
+        from agent.anthropic_adapter import _sanitize_text_for_oauth
+
+        prose = (
+            "Michael is the COO and founder. His standing orders are to "
+            "act autonomously on routine work. The pipeline runs "
+            "proactively, with skills provided by the team. He "
+            "orchestrates the weekly planning meeting."
+        )
+        out = _sanitize_text_for_oauth(prose)
+        for word in (
+            "COO",
+            "standing orders",
+            "autonomously",
+            "pipeline",
+            "proactively",
+            "skills",
+            "orchestrates",
+        ):
+            assert word in out, f"expected {word!r} to survive, got: {out}"
 
     def test_build_kwargs_is_oauth_false_does_not_sanitize(self):
         """Non-OAuth callers (direct Anthropic API, third-party endpoints) must

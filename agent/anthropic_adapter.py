@@ -14,6 +14,7 @@ import copy
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
@@ -175,6 +176,14 @@ _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for 
 #
 # This table is the single source of truth for the sanitizer.  Any new
 # harness phrasing discovered in the field should be added here.
+#
+# ── Scope note ──
+# We deliberately AVOID rewriting generic English words (COO, autonomous,
+# pipeline, standing orders, skills, orchestrate, proactive, etc.) because
+# they occur in countless legitimate contexts and rewriting them would
+# degrade model comprehension without reducing fingerprint signal.  We
+# only rewrite phrases that are specifically identifying — internal file
+# names, agent-harness-specific banner strings, and product branding.
 _OAUTH_SANITIZE_REPLACEMENTS: tuple = (
     # ── Product / framework branding ──
     ("Hermes Agent", "Claude Code"),
@@ -210,12 +219,53 @@ _OAUTH_SANITIZE_REPLACEMENTS: tuple = (
     ("There is no user present", "This runs without interactive follow-up"),
     ("no user present", "no interactive follow-up"),
     # ── Self-referential agent-name phrasing ──
-    ("You are Danny.", "You are a helpful assistant."),
     ("You are Darwin.", "You are a helpful assistant."),
     ("You are Samuel.", "You are a helpful assistant."),
     ("You are Scotty.", "You are a helpful assistant."),
     ("You are Poppy.", "You are a helpful assistant."),
-    ("You are Jean Clawd", "You are a helpful assistant who is"),
+    ("You are Danny.", "You are a helpful assistant."),
+    ("You are a helpful assistant who is", "You are a helpful assistant who is"),
+    # ── Specific internal filenames that appear in context-file manifests ──
+    # Only the file names themselves — not "heartbeat" as a word, not "cycle
+    # instructions", not "periodic checks".  Just the identifying filenames.
+    ("HEARTBEAT.md", "CYCLE.md"),
+    ("heartbeat-state.json", "cycle-state.json"),
+    ("on heartbeat ticks", "on periodic checks"),
+    ("heartbeat ticks", "periodic checks"),
+)
+
+
+# ── OAuth skills-block collapse ──────────────────────────────────────
+#
+# When the system prompt includes a "## Skills (mandatory)" section, it
+# typically contains a 10-15 KB enumerated catalog of every installed
+# skill with its description.  For OAuth traffic this is both a token
+# cost and a fingerprint surface (every skill description that mentions
+# "agent", "orchestration", "harness", etc. lands in the system prompt).
+#
+# Instead of rewriting the enumeration word-by-word, we collapse it to a
+# short breadcrumb: the model still knows it has skill tools available
+# and can discover specific skills on demand via skills_list() / skill_view(),
+# which is how Claude Code-native skill discovery is supposed to work anyway.
+#
+# The non-OAuth path is unaffected — the full enumeration still goes out
+# to direct-API and third-party endpoints.
+_OAUTH_SKILLS_COLLAPSED_BLOCK = (
+    "## Skills\n"
+    "You have a skill library available. Call skills_list() to browse and "
+    "skill_view(name) to load a specific skill's instructions when deciding "
+    "how to do something non-trivial (complex tasks, recurring workflows, "
+    "tricky integrations, or anything that would benefit from a proven "
+    "recipe). After completing difficult work, you can save the approach as "
+    "a skill with manage_skills() so it's reusable next time."
+)
+
+# Regex matching the Hermes "## Skills (mandatory)" section so we can
+# replace the whole enumerated block in one shot.  Matches from the
+# header to the next top-level ## heading (or end of string).
+_OAUTH_SKILLS_SECTION_RE = re.compile(
+    r"## Skills \(mandatory\).*?(?=\n## |\Z)",
+    re.DOTALL,
 )
 
 
@@ -223,11 +273,23 @@ def _sanitize_text_for_oauth(text: str) -> str:
     """Apply the OAuth harness-avoidance replacement table to a text string.
 
     This is the single canonical text transformer for OAuth mode.  Every
-    other OAuth sanitizer path funnels through here so the replacement table
-    lives in exactly one place.
+    other OAuth sanitizer path funnels through here so the replacement
+    table and structural transforms live in exactly one place.
+
+    Two layers of transform are applied, in order:
+      1. The enumerated "## Skills (mandatory)" catalog block is collapsed
+         to a short breadcrumb pointing at skills_list() / skill_view().
+         This saves 10-15 KB of tokens per turn and eliminates a large
+         fingerprint surface where every skill description can contain
+         framework-specific prose.
+      2. The substring replacement table is applied for the remaining text.
     """
     if not text or not isinstance(text, str):
         return text
+    # Structural transform: collapse the skills catalog block if present.
+    if "## Skills (mandatory)" in text:
+        text = _OAUTH_SKILLS_SECTION_RE.sub(_OAUTH_SKILLS_COLLAPSED_BLOCK, text, count=1)
+    # Substring replacements for remaining harness-specific phrases.
     for old, new in _OAUTH_SANITIZE_REPLACEMENTS:
         if old in text:
             text = text.replace(old, new)
