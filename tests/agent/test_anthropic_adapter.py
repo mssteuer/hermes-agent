@@ -62,10 +62,36 @@ class TestBuildAnthropicClient:
             kwargs = mock_sdk.Anthropic.call_args[1]
             assert "auth_token" in kwargs
             betas = kwargs["default_headers"]["anthropic-beta"]
+            # OAuth betas current as of Claude Code 2.1.112 (2026-04-16 audit).
+            # interleaved-thinking is merged in from _COMMON_BETAS.
             assert "oauth-2025-04-20" in betas
             assert "claude-code-20250219" in betas
             assert "interleaved-thinking-2025-05-14" in betas
-            assert "fine-grained-tool-streaming-2025-05-14" in betas
+            assert "context-1m-2025-08-07" in betas
+            assert "context-management-2025-06-27" in betas
+            assert "prompt-caching-scope-2026-01-05" in betas
+            assert "advisor-tool-2026-03-01" in betas
+            assert "advanced-tool-use-2025-11-20" in betas
+            assert "effort-2025-11-24" in betas
+            # fine-grained-tool-streaming is dropped from the OAuth set —
+            # Claude Code 2.1.112 stopped sending it on opus calls.
+            assert "fine-grained-tool-streaming-2025-05-14" not in betas
+            # No duplicate betas after the dedup pass.
+            parts = betas.split(",")
+            assert len(parts) == len(set(parts)), f"duplicate beta in {betas!r}"
+            # Header set must include the current Claude Code fingerprint
+            # (capital User-Agent, sdk-cli entrypoint, browser-direct flag).
+            assert (
+                kwargs["default_headers"]["User-Agent"].startswith("claude-cli/")
+                and "sdk-cli" in kwargs["default_headers"]["User-Agent"]
+            )
+            assert kwargs["default_headers"]["x-app"] == "cli"
+            assert (
+                kwargs["default_headers"]["anthropic-dangerous-direct-browser-access"]
+                == "true"
+            )
+            # The old lowercase "user-agent" duplicate must not be sent.
+            assert "user-agent" not in kwargs["default_headers"]
             assert "api_key" not in kwargs
 
     def test_api_key_uses_api_key(self):
@@ -1158,10 +1184,16 @@ class TestOAuthSanitizer:
         )
         system = kwargs["system"]
         assert isinstance(system, list)
-        # First block is the Claude Code identity prefix (untouched).
-        assert system[0]["text"].startswith("You are Claude Code")
-        # Second block is the sanitized original system prompt.
-        merged = "\n".join(b["text"] for b in system[1:])
+        # Block[0] is the x-anthropic-billing-header system text block — the
+        # primary OAuth classifier marker added in the 2026-04-16 refresh.
+        assert system[0]["text"].startswith("x-anthropic-billing-header:")
+        assert "cc_version=" in system[0]["text"]
+        assert "cc_entrypoint=sdk-cli" in system[0]["text"]
+        # Block[1] is the Claude Code identity prefix.  Matches the phrasing
+        # Claude Code 2.1.112 sends verbatim.
+        assert system[1]["text"].startswith("You are a Claude agent")
+        # Remaining blocks are the sanitized original system prompt.
+        merged = "\n".join(b["text"] for b in system[2:])
         assert "Hermes" not in merged
         assert "Nous Research" not in merged
         assert "Claude Code" in merged
@@ -1414,6 +1446,191 @@ def _serialize_for_fingerprint_scan(messages: list) -> str:
                         if isinstance(sub, dict) and sub.get("type") == "text":
                             chunks.append(sub.get("text", ""))
     return "\n".join(chunks)
+
+
+# ---------------------------------------------------------------------------
+# Model output limit lookup
+# ---------------------------------------------------------------------------
+
+
+class TestClaudeCodeFingerprintParity:
+    """Regression tests for the 2026-04-16 Claude Code fingerprint refresh.
+
+    Locks down the parity shape between what Hermes emits on OAuth requests
+    and what Claude Code 2.1.112 was observed sending in the capture audit
+    under ``~/.hermes/reference/oauth-audit-2026-04-16/``.  If any of these
+    tests start failing after a future Claude Code release it means the
+    audit needs to be re-run and the constants in ``anthropic_adapter``
+    refreshed to match the new upstream shape.
+    """
+
+    def _call(self, is_oauth=True, tools=None, reasoning_config=None):
+        return build_anthropic_kwargs(
+            model="claude-opus-4-7",
+            messages=[{"role": "user", "content": "Say hello in one word"}],
+            tools=tools,
+            max_tokens=4096,
+            reasoning_config=reasoning_config,
+            is_oauth=is_oauth,
+        )
+
+    # ── Billing header block ─────────────────────────────────────────
+
+    def test_billing_header_present_as_first_system_block(self):
+        kwargs = self._call()
+        system = kwargs["system"]
+        assert isinstance(system, list) and len(system) >= 2
+        first = system[0]["text"]
+        # Shape: "x-anthropic-billing-header: cc_version=X.Y.Z.B; cc_entrypoint=sdk-cli; cch=HHHHH;"
+        assert first.startswith("x-anthropic-billing-header:")
+        assert "cc_version=" in first
+        assert "cc_entrypoint=sdk-cli" in first
+        assert "cch=" in first
+        assert first.endswith(";")
+
+    def test_billing_header_uses_version_dot_build_format(self):
+        from agent.anthropic_adapter import (
+            _build_billing_header_text,
+            _CLAUDE_CODE_VERSION_FALLBACK,
+            _CLAUDE_CODE_BUILD_FALLBACK,
+        )
+        txt = _build_billing_header_text(
+            version=_CLAUDE_CODE_VERSION_FALLBACK,
+            build=_CLAUDE_CODE_BUILD_FALLBACK,
+        )
+        assert (
+            f"cc_version={_CLAUDE_CODE_VERSION_FALLBACK}."
+            f"{_CLAUDE_CODE_BUILD_FALLBACK}"
+        ) in txt
+
+    def test_billing_header_checksum_varies_per_call(self):
+        from agent.anthropic_adapter import _build_billing_header_text
+        seen = {_build_billing_header_text() for _ in range(20)}
+        # Randomness: 5 hex chars ≈ 1M bucket; 20 draws should not collapse.
+        assert len(seen) > 1
+
+    def test_billing_header_absent_when_not_oauth(self):
+        kwargs = self._call(is_oauth=False)
+        system = kwargs.get("system")
+        # Non-OAuth path keeps the user-supplied system prompt verbatim.
+        if isinstance(system, list):
+            text = "\n".join(
+                (b.get("text") or "") if isinstance(b, dict) else str(b)
+                for b in system
+            )
+        else:
+            text = system or ""
+        assert "x-anthropic-billing-header" not in text
+
+    # ── Identity line ────────────────────────────────────────────────
+
+    def test_identity_block_matches_claude_code_2_1_112_phrasing(self):
+        from agent.anthropic_adapter import _CLAUDE_CODE_SYSTEM_PREFIX
+        # Exact phrasing observed in captures — includes the "Agent SDK"
+        # reference Anthropic's classifier looks for.
+        assert _CLAUDE_CODE_SYSTEM_PREFIX == (
+            "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+        )
+        kwargs = self._call()
+        system = kwargs["system"]
+        assert system[1]["text"] == _CLAUDE_CODE_SYSTEM_PREFIX
+
+    # ── Per-request OAuth headers / query / metadata ─────────────────
+
+    def test_extra_query_beta_true(self):
+        kwargs = self._call()
+        assert kwargs.get("extra_query") == {"beta": "true"}
+
+    def test_extra_headers_include_session_and_request_ids(self):
+        kwargs = self._call()
+        hdrs = kwargs["extra_headers"]
+        # X-Claude-Code-Session-Id must be a UUID-shaped string.
+        sid = hdrs["X-Claude-Code-Session-Id"]
+        assert len(sid) == 36 and sid.count("-") == 4
+        rid = hdrs["x-client-request-id"]
+        assert len(rid) == 36 and rid.count("-") == 4
+
+    def test_session_id_is_stable_request_id_is_per_call(self):
+        # Clear any cached identity so we get a fresh session id.
+        import agent.anthropic_adapter as aa
+        aa._claude_code_identity_cache = None
+        first = self._call()["extra_headers"]
+        second = self._call()["extra_headers"]
+        assert first["X-Claude-Code-Session-Id"] == second["X-Claude-Code-Session-Id"]
+        assert first["x-client-request-id"] != second["x-client-request-id"]
+
+    def test_metadata_user_id_emitted_when_claude_identity_available(
+        self, tmp_path, monkeypatch
+    ):
+        import agent.anthropic_adapter as aa
+        # Point ~/.claude.json at a fake file carrying plausible values.
+        fake_home = tmp_path
+        (fake_home / ".claude.json").write_text(
+            json.dumps({
+                "userID": "a" * 64,  # device fingerprint
+                "oauthAccount": {
+                    "accountUuid": "11111111-2222-3333-4444-555555555555",
+                },
+            })
+        )
+        monkeypatch.setattr(aa.Path, "home", lambda: fake_home)
+        aa._claude_code_identity_cache = None
+
+        kwargs = self._call()
+        meta = kwargs.get("metadata")
+        assert isinstance(meta, dict) and "user_id" in meta
+        blob = json.loads(meta["user_id"])
+        assert blob["device_id"] == "a" * 64
+        assert blob["account_uuid"] == "11111111-2222-3333-4444-555555555555"
+        assert len(blob["session_id"]) == 36  # UUID
+
+    def test_metadata_user_id_absent_when_claude_identity_missing(
+        self, tmp_path, monkeypatch
+    ):
+        import agent.anthropic_adapter as aa
+        monkeypatch.setattr(aa.Path, "home", lambda: tmp_path)
+        aa._claude_code_identity_cache = None
+        kwargs = self._call()
+        # Without real device+account, we emit nothing rather than fake it.
+        assert "metadata" not in kwargs or "user_id" not in (kwargs["metadata"] or {})
+
+    def test_oauth_fingerprint_fields_absent_when_not_oauth(self):
+        kwargs = self._call(is_oauth=False)
+        assert "extra_query" not in kwargs or "beta" not in kwargs.get("extra_query", {})
+        hdrs = kwargs.get("extra_headers") or {}
+        assert "X-Claude-Code-Session-Id" not in hdrs
+        assert "x-client-request-id" not in hdrs
+        assert "user_id" not in (kwargs.get("metadata") or {})
+
+    # ── cache_control upgrade ────────────────────────────────────────
+
+    def test_main_system_block_uses_ephemeral_1h_global_cache(self):
+        # Build with a chunky system prompt so the upgrade logic has a target.
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-7",
+            messages=[
+                {"role": "system", "content": "X" * 4000},
+                {"role": "user", "content": "hi"},
+            ],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+            is_oauth=True,
+        )
+        system = kwargs["system"]
+        # The target block is the largest non-prefix text block; it should
+        # carry the upgraded cache_control form.
+        target = max(
+            (b for i, b in enumerate(system) if i >= 2 and isinstance(b, dict)),
+            key=lambda b: len(b.get("text") or ""),
+            default=None,
+        )
+        assert target is not None
+        assert target.get("cache_control") == {
+            "type": "ephemeral",
+            "ttl": "1h",
+            "scope": "global",
+        }
 
 
 # ---------------------------------------------------------------------------
