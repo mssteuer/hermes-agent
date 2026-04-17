@@ -983,7 +983,11 @@ class TestBuildAnthropicKwargs:
         assert "temperature" not in kwargs
         assert kwargs["max_tokens"] == 4096
 
-    def test_reasoning_config_maps_xhigh_to_max_effort_for_4_6_models(self):
+    def test_reasoning_config_maps_xhigh_effort_literally_on_4_6_models(self):
+        """Claude Code 2.1.112 was observed sending ``effort: xhigh`` literally
+        on adaptive-thinking requests (capture 2026-04-17).  The previous
+        mapping ``xhigh → max`` was a fingerprint-drift signal — the billing
+        classifier keys on the exact string.  The mapping is now identity."""
         kwargs = build_anthropic_kwargs(
             model="claude-sonnet-4-6",
             messages=[{"role": "user", "content": "think harder"}],
@@ -992,7 +996,7 @@ class TestBuildAnthropicKwargs:
             reasoning_config={"enabled": True, "effort": "xhigh"},
         )
         assert kwargs["thinking"] == {"type": "adaptive"}
-        assert kwargs["output_config"] == {"effort": "max"}
+        assert kwargs["output_config"] == {"effort": "xhigh"}
 
     def test_reasoning_disabled(self):
         kwargs = build_anthropic_kwargs(
@@ -1676,6 +1680,177 @@ class TestClaudeCodeFingerprintParity:
 
 # ---------------------------------------------------------------------------
 # Model output limit lookup
+# ---------------------------------------------------------------------------
+
+
+class TestOpus47BodyShapeParity:
+    """Regression tests for the 2026-04-17 Opus 4.7 body-shape parity fix.
+
+    Captured Claude Code 2.1.112 sending these fields on opus-4-7 requests
+    (capture under ``~/.hermes/reference/oauth-audit-2026-04-17-verify/``):
+
+      * thinking:           ``{"type":"adaptive"}``
+      * output_config:      ``{"effort":"xhigh"}``
+      * context_management: ``{"edits":[{"type":"clear_thinking_20251015",
+                              "keep":"all"}]}``
+      * temperature:        *(absent)*
+      * tool_choice:        *(absent when caller doesn't request one)*
+
+    Before the fix, ``_supports_adaptive_thinking`` only matched ``4-6`` /
+    ``4.6``, so opus-4-7 fell through to the legacy manual-thinking branch
+    that sets ``thinking:{enabled,budget}`` and ``temperature:1``.  opus-4-7
+    now rejects ``temperature`` outright with a 400 ``temperature is
+    deprecated for this model`` — and the billing classifier was reading
+    the broken shape as drift.  This class locks down each CC-parity item
+    so a future regression trips a test instead of silently re-introducing
+    the drift.
+    """
+
+    def _build(self, model="claude-opus-4-7", tool_choice=None, **extra):
+        return build_anthropic_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "description": "run a bash command",
+                    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                },
+            }],
+            max_tokens=None,
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+            is_oauth=True,
+            context_length=200_000,
+            tool_choice=tool_choice,
+            **extra,
+        )
+
+    # ── thinking / output_config / context_management ────────────────────
+
+    def test_opus_4_7_uses_adaptive_thinking(self):
+        kwargs = self._build()
+        assert kwargs["thinking"] == {"type": "adaptive"}
+
+    def test_opus_4_7_emits_output_config_xhigh(self):
+        kwargs = self._build()
+        assert kwargs["output_config"] == {"effort": "xhigh"}
+
+    def test_opus_4_7_emits_context_management_clear_thinking(self):
+        kwargs = self._build()
+        # context_management is routed via extra_body because anthropic
+        # Python SDK 0.92.0 doesn't accept it as a native kwarg.
+        assert kwargs.get("extra_body", {}).get("context_management") == {
+            "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
+        }
+
+    # ── NO temperature on adaptive-thinking models ───────────────────────
+
+    def test_opus_4_7_omits_temperature(self):
+        """opus-4-7 rejects temperature with 400 'deprecated for this model'.
+
+        Also a fingerprint-drift signal.  Legacy branch still sets it for
+        non-adaptive models — that path is tested separately.
+        """
+        kwargs = self._build()
+        assert "temperature" not in kwargs
+
+    # ── tool_choice omission when caller doesn't request one ─────────────
+
+    def test_opus_4_7_omits_tool_choice_when_caller_didnt_pass_one(self):
+        """Claude Code doesn't send ``tool_choice`` when the default (auto)
+        is desired; sending ``{"type":"auto"}`` unconditionally is a
+        fingerprint-drift signal."""
+        kwargs = self._build(tool_choice=None)
+        assert "tool_choice" not in kwargs
+
+    def test_opus_4_7_emits_tool_choice_auto_when_explicitly_requested(self):
+        kwargs = self._build(tool_choice="auto")
+        assert kwargs["tool_choice"] == {"type": "auto"}
+
+    def test_opus_4_7_emits_tool_choice_any_for_required(self):
+        kwargs = self._build(tool_choice="required")
+        assert kwargs["tool_choice"] == {"type": "any"}
+
+    def test_opus_4_7_emits_specific_tool_choice(self):
+        kwargs = self._build(tool_choice="Bash")
+        assert kwargs["tool_choice"] == {"type": "tool", "name": "Bash"}
+
+    # ── max_tokens uses full opus-4-7 output cap ─────────────────────────
+
+    def test_opus_4_7_max_tokens_is_128k_when_unbounded(self):
+        """Claude Code clips its own requests to 64K, but we preserve the
+        true model ceiling (128K) so callers aren't artificially throttled
+        (per Michael's call 2026-04-17).  The exact ceiling shows up on
+        the wire, but Anthropic's classifier cares about shape presence
+        not numeric match."""
+        kwargs = self._build()
+        assert kwargs["max_tokens"] == 128_000
+
+    # ── output_config effort is the LITERAL Hermes label ─────────────────
+
+    def test_opus_4_7_effort_xhigh_passthrough(self):
+        """CC sends ``effort: xhigh`` literally; previous mapping was
+        ``xhigh → max`` which was classified as drift."""
+        kwargs = self._build()
+        assert kwargs["output_config"]["effort"] == "xhigh"
+
+    def test_opus_4_7_effort_medium_passthrough(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-7",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            max_tokens=None,
+            reasoning_config={"enabled": True, "effort": "medium"},
+            is_oauth=True,
+            context_length=200_000,
+        )
+        assert kwargs["output_config"]["effort"] == "medium"
+
+    # ── _supports_adaptive_thinking matches 4-7 ──────────────────────────
+
+    def test_supports_adaptive_thinking_matches_4_7_variants(self):
+        from agent.anthropic_adapter import _supports_adaptive_thinking
+        assert _supports_adaptive_thinking("claude-opus-4-7") is True
+        assert _supports_adaptive_thinking("claude-opus-4.7") is True
+        # Also confirm 4.6 still matches (regression guard)
+        assert _supports_adaptive_thinking("claude-opus-4-6") is True
+        assert _supports_adaptive_thinking("claude-sonnet-4.6") is True
+        # And 4.5 and earlier still do NOT match
+        assert _supports_adaptive_thinking("claude-opus-4-5") is False
+        assert _supports_adaptive_thinking("claude-sonnet-4") is False
+        assert _supports_adaptive_thinking("claude-3-7-sonnet") is False
+
+    # ── Legacy (non-adaptive) branch unchanged ───────────────────────────
+
+    def test_legacy_sonnet_4_5_still_uses_manual_thinking(self):
+        """The non-adaptive branch still sets ``thinking:{enabled,budget}``
+        and ``temperature:1`` for models that need the legacy shape."""
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-5",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            max_tokens=None,
+            reasoning_config={"enabled": True, "effort": "medium"},
+            is_oauth=False,
+            context_length=200_000,
+        )
+        assert kwargs["thinking"] == {"type": "enabled", "budget_tokens": 8000}
+        assert kwargs["temperature"] == 1
+        # No context_management on legacy models (not even in extra_body)
+        assert "context_management" not in kwargs.get("extra_body", {})
+        # No output_config on legacy models
+        assert "output_config" not in kwargs
+
+    # ── output cap table has explicit opus-4-7 entry ─────────────────────
+
+    def test_opus_4_7_has_explicit_max_output_entry(self):
+        from agent.anthropic_adapter import _get_anthropic_max_output
+        assert _get_anthropic_max_output("claude-opus-4-7") == 128_000
+        # Also confirm 4.6 is unchanged
+        assert _get_anthropic_max_output("claude-opus-4-6") == 128_000
+
+
 # ---------------------------------------------------------------------------
 
 

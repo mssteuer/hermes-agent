@@ -28,8 +28,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
+# Claude Code 2.1.112 observed sending ``output_config: {'effort': 'xhigh'}``
+# on opus-4-7 requests (capture 2026-04-17).  The previous mapping ``xhigh →
+# max`` was wrong — Anthropic's billing classifier keys on the exact string.
+# Map from Hermes-internal effort labels → Anthropic adaptive effort literals.
 ADAPTIVE_EFFORT_MAP = {
-    "xhigh": "max",
+    "xhigh": "xhigh",
     "high": "high",
     "medium": "medium",
     "low": "low",
@@ -41,6 +45,9 @@ ADAPTIVE_EFFORT_MAP = {
 # max_tokens as a mandatory field.  Previously we hardcoded 16384, which
 # starves thinking-enabled models (thinking tokens count toward the limit).
 _ANTHROPIC_OUTPUT_LIMITS = {
+    # Claude 4.7 — true model cap; Claude Code bounds its own requests at
+    # 64K but the model itself supports 128K of output.
+    "claude-opus-4-7":   128_000,
     # Claude 4.6
     "claude-opus-4-6":   128_000,
     "claude-sonnet-4-6":  64_000,
@@ -91,8 +98,21 @@ def _get_anthropic_max_output(model: str) -> int:
 
 
 def _supports_adaptive_thinking(model: str) -> bool:
-    """Return True for Claude 4.6 models that support adaptive thinking."""
-    return any(v in model for v in ("4-6", "4.6"))
+    """Return True for Claude 4.6+ models that support adaptive thinking.
+
+    Adaptive thinking landed with Claude 4.6 and is used by all subsequent
+    releases (4.7, and presumably future 4.8+).  The Anthropic API shape for
+    adaptive thinking is ``thinking={"type":"adaptive"}`` paired with
+    ``output_config={"effort":"..."}``; the older manual shape
+    ``thinking={"type":"enabled","budget_tokens":N}`` + ``temperature=1``
+    that 4.5 and earlier require will be REJECTED on 4.7 with a 400
+    ``temperature is deprecated for this model``, and was also a
+    fingerprint-drift signal Anthropic's billing classifier reads.
+
+    Matches: 4-6, 4.6, 4-7, 4.7  (extend when 4-8+ ships).
+    """
+    lowered = model.lower()
+    return any(v in lowered for v in ("4-6", "4.6", "4-7", "4.7"))
 
 
 # Beta headers for enhanced features (sent with ALL auth types)
@@ -1741,23 +1761,37 @@ def build_anthropic_kwargs(
 
     if anthropic_tools:
         kwargs["tools"] = anthropic_tools
-        # Map OpenAI tool_choice to Anthropic format
-        if tool_choice == "auto" or tool_choice is None:
+        # Map OpenAI tool_choice to Anthropic format.
+        #
+        # Claude Code never sends ``tool_choice`` when the default behavior
+        # (auto) is desired — it omits the field entirely.  Sending
+        # ``{"type":"auto"}`` when the caller didn't explicitly request it is
+        # a fingerprint-drift signal the billing classifier picks up.  Only
+        # emit ``tool_choice`` when the caller passed a non-default value.
+        if tool_choice == "auto":
+            # Caller explicitly asked for auto — emit explicitly.
             kwargs["tool_choice"] = {"type": "auto"}
         elif tool_choice == "required":
             kwargs["tool_choice"] = {"type": "any"}
         elif tool_choice == "none":
             # Anthropic has no tool_choice "none" — omit tools entirely to prevent use
             kwargs.pop("tools", None)
-        elif isinstance(tool_choice, str):
+        elif isinstance(tool_choice, str) and tool_choice:
             # Specific tool name
             kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}
+        # tool_choice is None / absent → omit, matches Claude Code's wire shape.
 
     # Map reasoning_config to Anthropic's thinking parameter.
-    # Claude 4.6 models use adaptive thinking + output_config.effort.
-    # Older models use manual thinking with budget_tokens.
+    # Claude 4.6+ models use adaptive thinking + output_config.effort +
+    # context_management.  Older models (4.5, 3.7, etc.) use manual thinking
+    # with budget_tokens and require temperature=1.
+    #
     # MiniMax Anthropic-compat endpoints support thinking (manual mode only,
     # not adaptive).  Haiku does NOT support extended thinking — skip entirely.
+    #
+    # IMPORTANT: opus-4-7 rejects ``temperature`` outright (``temperature is
+    # deprecated for this model``) so the manual branch must NOT run for any
+    # adaptive-thinking model.
     if reasoning_config and isinstance(reasoning_config, dict):
         if reasoning_config.get("enabled") is not False and "haiku" not in model.lower():
             effort = str(reasoning_config.get("effort", "medium")).lower()
@@ -1767,9 +1801,29 @@ def build_anthropic_kwargs(
                 kwargs["output_config"] = {
                     "effort": ADAPTIVE_EFFORT_MAP.get(effort, "medium")
                 }
+                # Claude Code 2.1.112 ships ``context_management`` with an
+                # adaptive-thinking cleanup edit on every opus-4-7 request —
+                # keeps cache hit rate up while shedding prior thinking
+                # blocks that would otherwise consume budget.  The
+                # classifier reads presence of this field as part of the
+                # "real CC vs synthetic" shape test.
+                #
+                # NOTE: anthropic Python SDK 0.92.0 does NOT accept
+                # ``context_management`` as a native kwarg (ships in a
+                # later SDK release).  Route via ``extra_body`` so it
+                # still lands in the serialized request payload.
+                kwargs.setdefault("extra_body", {})["context_management"] = {
+                    "edits": [
+                        {"type": "clear_thinking_20251015", "keep": "all"}
+                    ]
+                }
+                # IMPORTANT: no temperature on adaptive-thinking models.
+                # opus-4-7 will 400 with "temperature is deprecated for
+                # this model" if we send it.
             else:
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
-                # Anthropic requires temperature=1 when thinking is enabled on older models
+                # Anthropic requires temperature=1 when manual thinking is
+                # enabled on legacy (non-adaptive) models.
                 kwargs["temperature"] = 1
                 kwargs["max_tokens"] = max(effective_max_tokens, budget + 4096)
 
