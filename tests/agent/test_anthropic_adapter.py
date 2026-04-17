@@ -1119,18 +1119,56 @@ class TestOAuthSanitizer:
     below lock down the expected behavior for every known fingerprint family.
     """
 
-    def test_text_helper_replaces_branding(self):
+    def test_text_helper_branding_tokens_pass_through(self):
+        # Brand-masking RHS entries were dropped in the 2026-04-16 cleanup
+        # because the RHS collided with legit inbound content (repo names,
+        # URLs, tool_results).  The wire-fingerprint refresh (billing-header,
+        # identity phrase, metadata.user_id) carries classification now, so
+        # these brand tokens MUST pass through the sanitizer unchanged.
         from agent.anthropic_adapter import _sanitize_text_for_oauth
-        assert _sanitize_text_for_oauth("Hermes Agent is cool") == "Claude Code is cool"
-        assert _sanitize_text_for_oauth("Welcome to Hermes") == "Welcome to Claude Code"
-        assert _sanitize_text_for_oauth("hermes-agent v1") == "claude-code v1"
+        assert _sanitize_text_for_oauth("Hermes Agent is cool") == "Hermes Agent is cool"
+        assert _sanitize_text_for_oauth("Welcome to Hermes") == "Welcome to Hermes"
+        assert _sanitize_text_for_oauth("hermes-agent v1") == "hermes-agent v1"
+        # The upstream-owner fingerprint IS still swapped: dirty
+        # "Nous Research" -> clean "Anthropic".
         assert _sanitize_text_for_oauth("by Nous Research") == "by Anthropic"
 
-    def test_text_helper_two_word_replaced_before_bare(self):
-        # "Hermes Agent" must win over the bare "Hermes" fallback so we don't
-        # end up with "Claude Code Agent" (double-replaced).
+    def test_text_helper_longest_first_ordering_cron_family(self):
+        # The original brand-masking invariant (Hermes Agent must win
+        # over bare Hermes) no longer applies because both entries were
+        # dropped.  The remaining longest-first invariant lives in the
+        # cron/task family:
+        #   "[Task context: this is a scheduled background task." must
+        #   win over "scheduled background task" which must win over
+        #   the bare "background task" entry.  If the table were
+        #   alphabetised, the bare form would match first and the
+        #   longer forms would never fire — a silent leak.
         from agent.anthropic_adapter import _sanitize_text_for_oauth
-        assert _sanitize_text_for_oauth("Hermes Agent docs") == "Claude Code docs"
+        # Probe the shortest pair: "scheduled background task" vs
+        # "background task".  Both currently map to themselves (no-op
+        # pass-through), but the TABLE ORDER must still be longest-
+        # first so future RHS changes are safe.
+        from agent.anthropic_adapter import _OAUTH_SANITIZE_REPLACEMENTS
+        entries = [lhs for lhs, _rhs in _OAUTH_SANITIZE_REPLACEMENTS]
+        scheduled_idx = next(
+            (i for i, e in enumerate(entries)
+             if e == "scheduled background task"),
+            None,
+        )
+        bare_idx = next(
+            (i for i, e in enumerate(entries) if e == "background task"),
+            None,
+        )
+        if scheduled_idx is not None and bare_idx is not None:
+            assert scheduled_idx < bare_idx, (
+                "longest-first ordering violated: \"background task\" "
+                "entry appears before \"scheduled background task\" — "
+                "alphabetisation would break the longest-first invariant"
+            )
+        # And round-trip the cleaning is stable (idempotent).
+        sample = "A scheduled background task runs now."
+        once = _sanitize_text_for_oauth(sample)
+        assert _sanitize_text_for_oauth(once) == once
 
     def test_text_helper_strips_openclaw_paths(self):
         from agent.anthropic_adapter import _sanitize_text_for_oauth
@@ -1184,19 +1222,22 @@ class TestOAuthSanitizer:
         )
         system = kwargs["system"]
         assert isinstance(system, list)
-        # Block[0] is the x-anthropic-billing-header system text block — the
-        # primary OAuth classifier marker added in the 2026-04-16 refresh.
+        # Block[0] is the x-anthropic-billing-header system text block —
+        # the primary OAuth classifier marker added in the 2026-04-16
+        # refresh.
         assert system[0]["text"].startswith("x-anthropic-billing-header:")
         assert "cc_version=" in system[0]["text"]
         assert "cc_entrypoint=sdk-cli" in system[0]["text"]
-        # Block[1] is the Claude Code identity prefix.  Matches the phrasing
-        # Claude Code 2.1.112 sends verbatim.
+        # Block[1] is the Claude-agent identity prefix.  Matches the
+        # phrasing Claude Code 2.1.112 sends verbatim.
         assert system[1]["text"].startswith("You are a Claude agent")
         # Remaining blocks are the sanitized original system prompt.
+        # The brand-masking RHS entries were dropped in the 2026-04-16
+        # cleanup, so "Hermes" passes through unchanged.  "Anthropic"
+        # IS still swapped (owner-of-us fingerprint).
         merged = "\n".join(b["text"] for b in system[2:])
-        assert "Hermes" not in merged
+        assert "Hermes" in merged
         assert "Nous Research" not in merged
-        assert "Claude Code" in merged
         assert "Anthropic" in merged
 
     def test_build_kwargs_sanitizes_user_string_content(self):
