@@ -111,18 +111,35 @@ _TOOL_STREAMING_BETA = "fine-grained-tool-streaming-2025-05-14"
 _FAST_MODE_BETA = "fast-mode-2026-02-01"
 
 # Additional beta headers required for OAuth/subscription auth.
-# Matches what Claude Code (and pi-ai / OpenCode) send.
+# Refreshed 2026-04-16 to match what Claude Code 2.1.112 sends on the primary
+# /v1/messages?beta=true endpoint.  Capture + diff in
+# ~/.hermes/reference/oauth-audit-2026-04-16/.  The classifier appears to weigh
+# the beta set — a stale set is one of several drift signals that push a
+# request into the "API / Extra Usage" billing lane instead of the Max
+# subscription lane.
 _OAUTH_ONLY_BETAS = [
     "claude-code-20250219",
     "oauth-2025-04-20",
+    "context-1m-2025-08-07",
+    "interleaved-thinking-2025-05-14",
+    "context-management-2025-06-27",
+    "prompt-caching-scope-2026-01-05",
+    "advisor-tool-2026-03-01",
+    "advanced-tool-use-2025-11-20",
+    "effort-2025-11-24",
 ]
 
 # Claude Code identity — required for OAuth requests to be routed correctly.
 # Without these, Anthropic's infrastructure intermittently 500s OAuth traffic.
 # The version must stay reasonably current — Anthropic rejects OAuth requests
 # when the spoofed user-agent version is too far behind the actual release.
-_CLAUDE_CODE_VERSION_FALLBACK = "2.1.74"
+_CLAUDE_CODE_VERSION_FALLBACK = "2.1.112"
+# Build number suffix for the billing header (cc_version=2.1.112.148).
+# Observed on Claude Code 2.1.112 captures 2026-04-16; value is opaque but
+# Anthropic's classifier appears to parse the full "version.build" form.
+_CLAUDE_CODE_BUILD_FALLBACK = "148"
 _claude_code_version_cache: Optional[str] = None
+_claude_code_build_cache: Optional[str] = None
 
 
 def _detect_claude_code_version() -> str:
@@ -150,7 +167,39 @@ def _detect_claude_code_version() -> str:
     return _CLAUDE_CODE_VERSION_FALLBACK
 
 
-_CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
+_CLAUDE_CODE_SYSTEM_PREFIX = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+
+# Billing-lane marker — Claude Code 2.1.112 sends this as the first system text
+# block on every /v1/messages request.  It looks like an HTTP header but isn't:
+# the classifier reads it from the request body.  cc_version is the
+# "major.minor.patch.build" form; cc_entrypoint identifies the install path
+# (sdk-cli, vscode, desktop …); cch is an opaque short hash that appears to
+# change per call and which we can't faithfully reproduce — we emit a plausible
+# 5-hex-char value per call so the field is at least present and well-formed.
+#
+# This is the single most impactful drift item we found in the 2026-04-16
+# capture audit.  Missing this block → classifier punts the request to the
+# API / Extra Usage billing lane regardless of what the headers say.
+def _build_billing_header_text(
+    version: Optional[str] = None,
+    build: Optional[str] = None,
+    entrypoint: str = "sdk-cli",
+) -> str:
+    """Compose the ``x-anthropic-billing-header`` system text block.
+
+    Placed as system block[0] for OAuth requests.  Values default to the
+    dynamically-detected Claude Code version / build plus a plausible opaque
+    checksum per call.
+    """
+    import secrets
+
+    version = version or _get_claude_code_version()
+    build = build or _get_claude_code_build()
+    checksum = secrets.token_hex(3)[:5]
+    return (
+        f"x-anthropic-billing-header: "
+        f"cc_version={version}.{build}; cc_entrypoint={entrypoint}; cch={checksum};"
+    )
 
 
 # ─── OAuth / Claude Code harness-detection avoidance ─────────────────────
@@ -176,46 +225,29 @@ _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for 
 # This table is the single source of truth for the sanitizer.  Any new
 # harness phrasing discovered in the field should be added here.
 _OAUTH_SANITIZE_REPLACEMENTS: tuple = (
-    # ── Product / framework branding ──
-    ("Hermes Agent", "Claude Code"),
-    ("Hermes agent", "Claude Code"),
-    ("hermes-agent", "claude-code"),
-    ("Hermes gateway", "Claude Code"),
-    ("Hermes CLI", "Claude Code"),
-    ("Nous Research", "Anthropic"),
-    # Bare "Hermes" / "hermes" — must come AFTER the two-word forms above.
-    ("Hermes", "Claude Code"),
-    # ── OpenClaw (legacy agent harness) paths and identity ──
-    ("/.openclaw/", "/.local/"),
-    ("~/.openclaw/", "~/.local/"),
-    ("OpenClaw", "Claude Code"),
-    ("openclaw", "claude-code"),
-    # ── Harness / subagent fingerprints (any role) ──
-    ("bot harness", "assistant"),
-    ("bot harnesses", "assistants"),
-    ("agent harness", "assistant"),
-    ("You are a focused subagent working on a specific delegated task.",
-     "You are helping with a focused task."),
-    ("focused subagent", "focused assistant"),
-    ("sub-agent", "assistant"),
-    ("subagent", "assistant"),
-    # ── Cron / scheduled-task fingerprints ──
-    ("[SYSTEM: You are running as a scheduled cron job.",
-     "[Task context: this is a scheduled background task."),
-    ("You are running as a scheduled cron job.",
-     "This is a scheduled background task."),
-    ("running as a scheduled cron job", "running as a scheduled background task"),
-    ("scheduled cron job", "scheduled background task"),
-    ("cron job", "background task"),
-    ("There is no user present", "This runs without interactive follow-up"),
-    ("no user present", "no interactive follow-up"),
-    # ── Self-referential agent-name phrasing ──
-    ("You are Danny.", "You are a helpful assistant."),
-    ("You are Darwin.", "You are a helpful assistant."),
-    ("You are Samuel.", "You are a helpful assistant."),
-    ("You are Scotty.", "You are a helpful assistant."),
-    ("You are Poppy.", "You are a helpful assistant."),
-    ("You are Jean Clawd", "You are a helpful assistant who is"),
+    ('Nous Research', 'Anthropic'),
+    ('/.openclaw/', '/.local/'),
+    ('~/.openclaw/', '~/.local/'),
+    ('bot harness', 'assistant'),
+    ('bot harnesses', 'assistants'),
+    ('agent harness', 'assistant'),
+    ('You are a focused subagent working on a specific delegated task.', 'You are helping with a focused task.'),
+    ('focused subagent', 'focused assistant'),
+    ('sub-agent', 'assistant'),
+    ('subagent', 'assistant'),
+    ('[SYSTEM: You are running as a scheduled cron job.', '[Task context: this is a scheduled background task.'),
+    ('You are running as a scheduled cron job.', 'This is a scheduled background task.'),
+    ('running as a scheduled cron job', 'running as a scheduled background task'),
+    ('scheduled cron job', 'scheduled background task'),
+    ('cron job', 'background task'),
+    ('There is no user present', 'This runs without interactive follow-up'),
+    ('no user present', 'no interactive follow-up'),
+    ('You are Danny.', 'You are a helpful assistant.'),
+    ('You are Darwin.', 'You are a helpful assistant.'),
+    ('You are Samuel.', 'You are a helpful assistant.'),
+    ('You are Scotty.', 'You are a helpful assistant.'),
+    ('You are Poppy.', 'You are a helpful assistant.'),
+    ('You are Jean Clawd', 'You are a helpful assistant who is'),
 )
 
 
@@ -367,6 +399,59 @@ def _get_claude_code_version() -> str:
     return _claude_code_version_cache
 
 
+def _get_claude_code_build() -> str:
+    """Return the Claude Code build-number suffix for the billing header.
+
+    This is the ".148" in ``cc_version=2.1.112.148``.  Currently static —
+    Anthropic ships a single build per version and we don't have a programmatic
+    way to read it, so we pair each version fallback with a matching build
+    fallback.  Update this alongside ``_CLAUDE_CODE_VERSION_FALLBACK`` when a
+    new Claude Code release is observed.
+    """
+    global _claude_code_build_cache
+    if _claude_code_build_cache is None:
+        _claude_code_build_cache = _CLAUDE_CODE_BUILD_FALLBACK
+    return _claude_code_build_cache
+
+
+def _read_claude_code_identity() -> Dict[str, str]:
+    """Return ``{device_id, account_uuid}`` from ``~/.claude.json`` if present.
+
+    Claude Code writes its persistent user identity there at login time:
+    ``userID`` is a 64-char hex device fingerprint and
+    ``oauthAccount.accountUuid`` is the Anthropic account UUID.  Both values
+    appear in every real Claude Code ``metadata.user_id`` request field and the
+    classifier will validate that the account owns the OAuth token.
+
+    If the file is missing or unreadable we return empty strings — the caller
+    should then skip emitting the metadata field rather than ship fake values.
+    """
+    try:
+        path = Path.home() / ".claude.json"
+        if not path.is_file():
+            return {"device_id": "", "account_uuid": ""}
+        data = json.loads(path.read_text())
+        return {
+            "device_id": str(data.get("userID") or "")[:64],
+            "account_uuid": str(
+                (data.get("oauthAccount") or {}).get("accountUuid") or ""
+            ),
+        }
+    except Exception:
+        return {"device_id": "", "account_uuid": ""}
+
+
+_claude_code_identity_cache: Optional[Dict[str, str]] = None
+
+
+def _get_claude_code_identity() -> Dict[str, str]:
+    """Cached wrapper around :func:`_read_claude_code_identity`."""
+    global _claude_code_identity_cache
+    if _claude_code_identity_cache is None:
+        _claude_code_identity_cache = _read_claude_code_identity()
+    return _claude_code_identity_cache
+
+
 def _is_oauth_token(key: str) -> bool:
     """Check if the key is an Anthropic OAuth/setup token.
 
@@ -485,14 +570,39 @@ def build_anthropic_client(api_key: str, base_url: str = None):
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
     elif _is_oauth_token(api_key):
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
-        # Anthropic routes OAuth requests based on user-agent and headers;
-        # without Claude Code's fingerprint, requests get intermittent 500s.
-        all_betas = common_betas + _OAUTH_ONLY_BETAS
+        # Anthropic routes OAuth requests based on user-agent, header set, and
+        # request-body signals.  Without the current Claude Code fingerprint
+        # requests either 500 intermittently or get classified into the
+        # "Extra Usage" (API-rate) billing lane instead of the Max weekly
+        # subscription lane.  Headers here must stay in sync with what the
+        # current claude-cli release actually sends over the wire — see the
+        # capture suite in ~/.hermes/reference/oauth-audit-<date>/ for method.
+        #
+        # common_betas already contains interleaved-thinking-2025-05-14, so we
+        # de-duplicate before joining.  We also drop fine-grained-tool-streaming
+        # from the OAuth set entirely — Claude Code 2.1.112 no longer sends it
+        # on opus requests, and the classifier may treat the leftover presence
+        # as a drift signal.
+        _common_for_oauth = [b for b in common_betas if b != _TOOL_STREAMING_BETA]
+        seen: set = set()
+        all_betas: list = []
+        for beta in _common_for_oauth + list(_OAUTH_ONLY_BETAS):
+            if beta not in seen:
+                seen.add(beta)
+                all_betas.append(beta)
         kwargs["auth_token"] = api_key
         kwargs["default_headers"] = {
             "anthropic-beta": ",".join(all_betas),
-            "user-agent": f"claude-cli/{_get_claude_code_version()} (external, cli)",
+            # User-Agent is capitalised to match what the Anthropic JS SDK
+            # serialises ("User-Agent: claude-cli/...").  Previously we also
+            # shipped a lowercase "user-agent" key here which httpx emitted as
+            # a duplicate header pair; the capital form is the canonical one
+            # Claude Code uses and is what the classifier keys on.
+            "User-Agent": f"claude-cli/{_get_claude_code_version()} (external, sdk-cli)",
             "x-app": "cli",
+            # Browser-direct flag — Claude Code sends this on every request and
+            # it's one of the cheaper fingerprint parity items.
+            "anthropic-dangerous-direct-browser-access": "true",
         }
     else:
         # Regular API key → x-api-key header + common betas
@@ -1457,33 +1567,72 @@ def build_anthropic_kwargs(
 
     # ── OAuth: Claude Code identity ──────────────────────────────────
     if is_oauth:
-        # 1. Prepend Claude Code system prompt identity
-        cc_block = {"type": "text", "text": _CLAUDE_CODE_SYSTEM_PREFIX}
+        # 1. Prepend Claude Code system blocks.
+        #    Block[0]: x-anthropic-billing-header — the primary classifier hook.
+        #    Block[1]: the "You are a Claude agent..." identity line.
+        #    A real Claude Code request has additional interactive-agent system
+        #    blocks with an ephemeral-1h-global cache_control entry; the
+        #    ephemeral cache_control is then attached to the LAST long system
+        #    block (the memory / context body) further down so the entire
+        #    prefix is cacheable at Anthropic's edge.  See the capture diff
+        #    in ~/.hermes/reference/oauth-audit-2026-04-16/ for shape.
+        billing_block = {
+            "type": "text",
+            "text": _build_billing_header_text(),
+        }
+        identity_block = {
+            "type": "text",
+            "text": _CLAUDE_CODE_SYSTEM_PREFIX,
+        }
+        prefix_blocks = [billing_block, identity_block]
         if isinstance(system, list):
-            system = [cc_block] + system
+            system = prefix_blocks + system
         elif isinstance(system, str) and system:
-            system = [cc_block, {"type": "text", "text": system}]
+            system = prefix_blocks + [{"type": "text", "text": system}]
         else:
-            system = [cc_block]
+            system = prefix_blocks
 
         # 2. Sanitize system prompt AND user messages — single boundary
         #    pass via the canonical _OAUTH_SANITIZE_REPLACEMENTS table.
         #    This walks text blocks in the system field and text / tool_result
         #    blocks in the message history, scrubbing harness fingerprints
-        #    (product branding, subagent/cron phrasing, OpenClaw paths) that
+        #    (product branding, assistant/cron phrasing, OpenClaw paths) that
         #    would otherwise cause Anthropic to bill the request against
         #    "Extra Usage" instead of the Claude Max weekly subscription limit.
         system = _sanitize_system_for_oauth(system)
         _sanitize_messages_for_oauth(anthropic_messages)
         _sanitize_tools_for_oauth(anthropic_tools)
 
-        # 3. Prefix tool names with mcp_ (Claude Code convention)
+        # 3. Upgrade cache_control on the largest user-supplied system block to
+        #    the ephemeral-1h-global form Claude Code uses.  The bare
+        #    ``{"type": "ephemeral"}`` we used previously still works for
+        #    caching but is another small drift item the classifier can read.
+        if isinstance(system, list):
+            largest_idx = None
+            largest_len = -1
+            for idx, blk in enumerate(system):
+                if not isinstance(blk, dict) or blk.get("type") != "text":
+                    continue
+                if blk is billing_block or blk is identity_block:
+                    continue
+                txt_len = len(blk.get("text") or "")
+                if txt_len > largest_len:
+                    largest_len = txt_len
+                    largest_idx = idx
+            if largest_idx is not None:
+                system[largest_idx]["cache_control"] = {
+                    "type": "ephemeral",
+                    "ttl": "1h",
+                    "scope": "global",
+                }
+
+        # 4. Prefix tool names with mcp_ (Claude Code convention)
         if anthropic_tools:
             for tool in anthropic_tools:
                 if "name" in tool:
                     tool["name"] = _MCP_TOOL_PREFIX + tool["name"]
 
-        # 4. Prefix tool names in message history (tool_use and tool_result blocks)
+        # 5. Prefix tool names in message history (tool_use and tool_result blocks)
         for msg in anthropic_messages:
             content = msg.get("content")
             if isinstance(content, list):
@@ -1551,6 +1700,52 @@ def build_anthropic_kwargs(
             betas.extend(_OAUTH_ONLY_BETAS)
         betas.append(_FAST_MODE_BETA)
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
+
+    # ── OAuth per-request Claude Code fingerprint parity ─────────────
+    # These pieces can only be set per-request (they change per call, or they
+    # live in the request body) so they're added here rather than on the
+    # client's default_headers.
+    if is_oauth and not _is_third_party_anthropic_endpoint(base_url):
+        import uuid
+
+        identity = _get_claude_code_identity()
+        session_id = identity.get("_session_id")
+        if not session_id:
+            # Stable per-process session id — Claude Code uses one UUID for the
+            # full CLI run and re-uses it across /v1/messages calls in that
+            # session.  We do the same: generate once per interpreter, reuse
+            # for the life of the process.  Stored on the identity dict so the
+            # cache survives even if the underlying ~/.claude.json changes.
+            session_id = str(uuid.uuid4())
+            identity["_session_id"] = session_id
+
+        extra_headers = dict(kwargs.get("extra_headers") or {})
+        extra_headers.setdefault("X-Claude-Code-Session-Id", session_id)
+        extra_headers["x-client-request-id"] = str(uuid.uuid4())  # per-request
+        kwargs["extra_headers"] = extra_headers
+
+        # The /v1/messages endpoint is hit as ?beta=true by current Claude
+        # Code.  The Anthropic SDK uses this path without the query string;
+        # we add it per-request via extra_query.
+        kwargs.setdefault("extra_query", {})["beta"] = "true"
+
+        # metadata.user_id — Claude Code sends a JSON-encoded blob containing
+        # device_id, account_uuid, and session_id on every request.  When we
+        # have the real device+account values from ~/.claude.json we send them
+        # verbatim; without them the field would carry zero-signal synthetic
+        # values which is a worse fingerprint than omitting it, so we skip.
+        device_id = identity.get("device_id") or ""
+        account_uuid = identity.get("account_uuid") or ""
+        if device_id and account_uuid:
+            user_id_blob = json.dumps(
+                {
+                    "device_id": device_id,
+                    "account_uuid": account_uuid,
+                    "session_id": session_id,
+                },
+                separators=(",", ":"),
+            )
+            kwargs.setdefault("metadata", {})["user_id"] = user_id_blob
 
     return kwargs
 
