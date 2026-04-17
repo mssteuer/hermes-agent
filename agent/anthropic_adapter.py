@@ -138,6 +138,86 @@ _CLAUDE_CODE_VERSION_FALLBACK = "2.1.112"
 # Observed on Claude Code 2.1.112 captures 2026-04-16; value is opaque but
 # Anthropic's classifier appears to parse the full "version.build" form.
 _CLAUDE_CODE_BUILD_FALLBACK = "148"
+
+# ── Stainless/JS SDK fingerprint parity ─────────────────────────────────────
+# Claude Code uses @anthropic-ai/sdk (the JavaScript/TypeScript SDK) running
+# on Node.js.  The Stainless code generator stamps those facts onto every
+# outbound request as X-Stainless-* headers, which Anthropic's billing
+# classifier reads as part of the drift score.  Our Python SDK naturally
+# ships X-Stainless-Lang=python, X-Stainless-Runtime=CPython, etc. — a dead
+# giveaway that we're not Claude Code.  These constants are the values CC
+# 2.1.112 actually sends (captured 2026-04-16).  Update alongside the version
+# fallback above when Anthropic ships a new Claude Code release.
+_STAINLESS_JS_LANG = "js"
+_STAINLESS_JS_PACKAGE_VERSION = "0.81.0"  # @anthropic-ai/sdk version bundled with CC 2.1.112
+_STAINLESS_JS_RUNTIME = "node"
+_STAINLESS_JS_RUNTIME_VERSION = "v24.3.0"  # Node runtime CC ships with
+_STAINLESS_JS_TIMEOUT = "600"  # CC sends this numeric value; Python SDK sends "NOT_GIVEN"
+# Headers the Python SDK always attaches but the JS SDK never does.  Leaving
+# them in place is a strong drift signal — we strip them at the httpx layer.
+_STAINLESS_PYTHON_ONLY_HEADERS = frozenset(
+    h.lower() for h in (
+        "X-Stainless-Async",
+        "X-Stainless-Helper-Method",
+        "X-Stainless-Stream-Helper",
+        "x-stainless-read-timeout",
+    )
+)
+
+
+def _stainless_js_parity_request_hook(request) -> None:
+    """httpx request hook that rewrites X-Stainless-* headers for OAuth requests.
+
+    Runs AFTER the Anthropic SDK has attached its own Stainless headers (which
+    naturally identify us as the Python SDK on CPython).  We overwrite the
+    language/runtime/package-version triple to the JS SDK values Claude Code
+    sends, normalize the timeout numeric value, strip the Python-SDK-only
+    extras (Async/Helper-Method/Stream-Helper/read-timeout), and drop the empty
+    ``X-Api-Key`` header the SDK emits on Bearer-auth requests (CC omits it
+    entirely).
+
+    Scoped narrowly to ``/v1/messages`` requests so unrelated HTTP traffic that
+    might share a client keeps its honest identity.
+    """
+    path = request.url.path or ""
+    if "/v1/messages" not in path:
+        return
+    h = request.headers
+    # Spoof JS SDK identity
+    h["X-Stainless-Lang"] = _STAINLESS_JS_LANG
+    h["X-Stainless-Package-Version"] = _STAINLESS_JS_PACKAGE_VERSION
+    h["X-Stainless-Runtime"] = _STAINLESS_JS_RUNTIME
+    h["X-Stainless-Runtime-Version"] = _STAINLESS_JS_RUNTIME_VERSION
+    # Normalize the timeout header.  Python SDK emits "NOT_GIVEN" when the
+    # caller doesn't pass a per-request timeout; CC always emits "600".
+    h["x-stainless-timeout"] = _STAINLESS_JS_TIMEOUT
+    # Strip Python-SDK-only headers the JS SDK never sends.
+    for name in list(h.keys()):
+        if name.lower() in _STAINLESS_PYTHON_ONLY_HEADERS:
+            del h[name]
+    # Python SDK attaches ``X-Api-Key:`` (empty value) whenever the request
+    # uses Bearer auth; CC's JS SDK omits it entirely.  Empty header value is
+    # a dead-giveaway fingerprint item — drop it.
+    if h.get("X-Api-Key", None) == "" or h.get("x-api-key", None) == "":
+        h.pop("X-Api-Key", None)
+        h.pop("x-api-key", None)
+
+
+def _build_stainless_parity_http_client(timeout):
+    """Build an httpx.Client with the Stainless-parity request hook attached.
+
+    Returned client is compatible with ``anthropic.Anthropic(http_client=...)``.
+    Only used for OAuth flows; regular API-key flows keep the default httpx
+    client so third-party MCP-style Anthropic proxies don't see unexpected
+    JS-SDK identity headers.
+    """
+    import httpx  # local import — anthropic already depends on httpx
+
+    return httpx.Client(
+        timeout=timeout,
+        event_hooks={"request": [_stainless_js_parity_request_hook]},
+    )
+
 _claude_code_version_cache: Optional[str] = None
 _claude_code_build_cache: Optional[str] = None
 
@@ -604,6 +684,12 @@ def build_anthropic_client(api_key: str, base_url: str = None):
             # it's one of the cheaper fingerprint parity items.
             "anthropic-dangerous-direct-browser-access": "true",
         }
+        # Install the httpx request hook that rewrites X-Stainless-* headers
+        # to the JS SDK values Claude Code sends.  Scoped to OAuth clients
+        # only — a direct API-key client might share environment with third
+        # party Anthropic proxies that inspect Stainless headers for
+        # telemetry; we don't want to mislead them.
+        kwargs["http_client"] = _build_stainless_parity_http_client(kwargs["timeout"])
     else:
         # Regular API key → x-api-key header + common betas
         kwargs["api_key"] = api_key

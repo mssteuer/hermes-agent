@@ -1679,6 +1679,221 @@ class TestClaudeCodeFingerprintParity:
 # ---------------------------------------------------------------------------
 
 
+class TestStainlessJsParity:
+    """Regression tests for the 2026-04-17 Stainless/JS SDK parity fix.
+
+    Claude Code uses @anthropic-ai/sdk on Node.js, which stamps X-Stainless-*
+    headers identifying itself as a JS runtime.  Hermes's Python SDK stamps
+    Python-runtime values that leak through as a fingerprint drift signal.
+    We install an httpx request hook that rewrites those headers on OAuth
+    ``/v1/messages`` requests to the JS values CC 2.1.112 actually sent
+    (captured 2026-04-16 under ``~/.hermes/reference/oauth-audit-2026-04-16/``).
+
+    Locking down the expected hook behavior and constants so a future SDK
+    upgrade that changes Stainless header shape trips a test instead of
+    silently re-introducing drift.
+    """
+
+    def _make_messages_request(self, **header_overrides):
+        """Build an httpx.Request that looks like the Python SDK emits."""
+        import httpx
+
+        default = {
+            "X-Stainless-Lang": "python",
+            "X-Stainless-Package-Version": "0.92.0",
+            "X-Stainless-OS": "Linux",
+            "X-Stainless-Arch": "x64",
+            "X-Stainless-Runtime": "CPython",
+            "X-Stainless-Runtime-Version": "3.11.15",
+            "X-Stainless-Async": "false",
+            "X-Stainless-Helper-Method": "stream",
+            "X-Stainless-Stream-Helper": "messages",
+            "x-stainless-retry-count": "0",
+            "x-stainless-timeout": "NOT_GIVEN",
+            "x-stainless-read-timeout": "900.0",
+            "X-Api-Key": "",
+            "User-Agent": "claude-cli/2.1.112 (external, sdk-cli)",
+        }
+        default.update(header_overrides)
+        return httpx.Request(
+            "POST",
+            "https://api.anthropic.com/v1/messages?beta=true",
+            headers=default,
+            content=b"{}",
+        )
+
+    # ── Hook spoofs JS identity ──────────────────────────────────────────
+
+    def test_hook_rewrites_lang_to_js(self):
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook
+
+        req = self._make_messages_request()
+        _stainless_js_parity_request_hook(req)
+        assert req.headers.get("X-Stainless-Lang") == "js"
+
+    def test_hook_rewrites_runtime_to_node(self):
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook
+
+        req = self._make_messages_request()
+        _stainless_js_parity_request_hook(req)
+        assert req.headers.get("X-Stainless-Runtime") == "node"
+
+    def test_hook_sets_package_version_to_js_sdk_0_81_0(self):
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook
+
+        req = self._make_messages_request()
+        _stainless_js_parity_request_hook(req)
+        assert req.headers.get("X-Stainless-Package-Version") == "0.81.0"
+
+    def test_hook_sets_runtime_version_to_node_v24(self):
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook
+
+        req = self._make_messages_request()
+        _stainless_js_parity_request_hook(req)
+        assert req.headers.get("X-Stainless-Runtime-Version") == "v24.3.0"
+
+    def test_hook_normalizes_timeout_numeric(self):
+        """Python SDK sends 'NOT_GIVEN'; CC sends '600'."""
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook
+
+        req = self._make_messages_request()
+        _stainless_js_parity_request_hook(req)
+        assert req.headers.get("x-stainless-timeout") == "600"
+
+    # ── Hook strips Python-SDK-only extras ───────────────────────────────
+
+    def test_hook_strips_stainless_async(self):
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook
+
+        req = self._make_messages_request()
+        _stainless_js_parity_request_hook(req)
+        assert "x-stainless-async" not in {k.lower() for k in req.headers.keys()}
+
+    def test_hook_strips_stainless_helper_method(self):
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook
+
+        req = self._make_messages_request()
+        _stainless_js_parity_request_hook(req)
+        assert "x-stainless-helper-method" not in {k.lower() for k in req.headers.keys()}
+
+    def test_hook_strips_stainless_stream_helper(self):
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook
+
+        req = self._make_messages_request()
+        _stainless_js_parity_request_hook(req)
+        assert "x-stainless-stream-helper" not in {k.lower() for k in req.headers.keys()}
+
+    def test_hook_strips_stainless_read_timeout(self):
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook
+
+        req = self._make_messages_request()
+        _stainless_js_parity_request_hook(req)
+        assert "x-stainless-read-timeout" not in {k.lower() for k in req.headers.keys()}
+
+    # ── Hook drops empty X-Api-Key ───────────────────────────────────────
+
+    def test_hook_drops_empty_x_api_key(self):
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook
+
+        req = self._make_messages_request()
+        _stainless_js_parity_request_hook(req)
+        # httpx headers are case-insensitive; check via dict access
+        assert "x-api-key" not in {k.lower() for k in req.headers.keys()}
+
+    # ── Hook preserves unrelated headers ─────────────────────────────────
+
+    def test_hook_preserves_retry_count(self):
+        """x-stainless-retry-count matches CC format so keep it alone."""
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook
+
+        req = self._make_messages_request()
+        _stainless_js_parity_request_hook(req)
+        assert req.headers.get("x-stainless-retry-count") == "0"
+
+    def test_hook_preserves_user_agent(self):
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook
+
+        req = self._make_messages_request()
+        _stainless_js_parity_request_hook(req)
+        assert req.headers.get("User-Agent") == "claude-cli/2.1.112 (external, sdk-cli)"
+
+    # ── Hook is scoped to /v1/messages ───────────────────────────────────
+
+    def test_hook_skips_non_messages_path(self):
+        """Non-/v1/messages requests keep their honest identity."""
+        import httpx
+
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook
+
+        req = httpx.Request(
+            "GET",
+            "https://api.anthropic.com/v1/models",
+            headers={
+                "X-Stainless-Lang": "python",
+                "X-Stainless-Runtime": "CPython",
+                "X-Stainless-Async": "false",
+            },
+        )
+        _stainless_js_parity_request_hook(req)
+        assert req.headers.get("X-Stainless-Lang") == "python"
+        assert req.headers.get("X-Stainless-Runtime") == "CPython"
+        assert req.headers.get("X-Stainless-Async") == "false"
+
+    # ── Constants sanity (byte-for-byte match with CC capture) ───────────
+
+    def test_constants_match_claude_code_2_1_112_capture(self):
+        from agent.anthropic_adapter import (
+            _STAINLESS_JS_LANG,
+            _STAINLESS_JS_PACKAGE_VERSION,
+            _STAINLESS_JS_RUNTIME,
+            _STAINLESS_JS_RUNTIME_VERSION,
+            _STAINLESS_JS_TIMEOUT,
+        )
+
+        assert _STAINLESS_JS_LANG == "js"
+        assert _STAINLESS_JS_PACKAGE_VERSION == "0.81.0"
+        assert _STAINLESS_JS_RUNTIME == "node"
+        assert _STAINLESS_JS_RUNTIME_VERSION == "v24.3.0"
+        assert _STAINLESS_JS_TIMEOUT == "600"
+
+    # ── Builder wires hook into OAuth client ─────────────────────────────
+
+    def test_build_client_installs_hook_for_oauth(self):
+        """OAuth clients must get the Stainless-parity httpx client."""
+        from agent.anthropic_adapter import build_anthropic_client
+
+        # sk-ant-oat- prefix (but NOT sk-ant-api) → classified as OAuth
+        oauth_token = "sk-ant-oat-" + ("A" * 60)
+        client = build_anthropic_client(api_key=oauth_token, base_url=None)
+        # Anthropic SDK stores the client we passed in; confirm its request
+        # event hooks include ours.
+        inner = getattr(client, "_client", None)
+        assert inner is not None, "Anthropic SDK internal httpx client not found"
+        hooks = inner.event_hooks.get("request", [])
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook as hook
+        assert hook in hooks, (
+            "Stainless-parity hook not installed on OAuth client "
+            f"(event_hooks['request']={hooks!r})"
+        )
+
+    def test_build_client_does_not_install_hook_for_api_key(self):
+        """Regular API-key clients keep their honest Python identity."""
+        from agent.anthropic_adapter import build_anthropic_client
+
+        # sk-ant-api- prefix → regular API key, NOT OAuth
+        api_key = "sk-ant-api03-" + ("A" * 80)
+        client = build_anthropic_client(api_key=api_key, base_url=None)
+        inner = getattr(client, "_client", None)
+        assert inner is not None
+        hooks = inner.event_hooks.get("request", [])
+        from agent.anthropic_adapter import _stainless_js_parity_request_hook as hook
+        # Either no hooks, or at least our OAuth-specific hook isn't there
+        assert hook not in hooks
+
+
+# ---------------------------------------------------------------------------
+
+
 class TestGetAnthropicMaxOutput:
     def test_opus_4_6(self):
         from agent.anthropic_adapter import _get_anthropic_max_output
