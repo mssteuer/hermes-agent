@@ -1438,6 +1438,22 @@ class TestListSessionsRich:
         # No messages, so last_active falls back to started_at
         assert sessions[0]["last_active"] == sessions[0]["started_at"]
 
+    def test_last_active_normalizes_legacy_iso_started_at(self, db):
+        db.create_session("legacy", "cli")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=?, ended_at=? WHERE id=?",
+            ("2026-04-09T12:00:00", "2026-04-09T13:00:00", "legacy"),
+        )
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich()
+        legacy = next(s for s in sessions if s["id"] == "legacy")
+
+        assert isinstance(legacy["started_at"], float)
+        assert isinstance(legacy["ended_at"], float)
+        assert isinstance(legacy["last_active"], float)
+        assert legacy["last_active"] == legacy["started_at"]
+
     def test_rich_list_includes_title(self, db):
         db.create_session("s1", "cli")
         db.set_session_title("s1", "refactoring auth")

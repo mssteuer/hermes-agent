@@ -198,8 +198,30 @@ from hermes_constants import AI_GATEWAY_BASE_URL, OPENROUTER_BASE_URL
 logger = logging.getLogger(__name__)
 
 
+def _coerce_timestamp(ts):
+    """Best-effort parse for epoch or ISO-8601 timestamps."""
+    if ts is None or ts == "":
+        return None
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    if isinstance(ts, str):
+        raw = ts.strip()
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
 def _relative_time(ts) -> str:
     """Format a timestamp as relative time (e.g., '2h ago', 'yesterday')."""
+    ts = _coerce_timestamp(ts)
     if not ts:
         return "?"
     delta = _time.time() - ts
