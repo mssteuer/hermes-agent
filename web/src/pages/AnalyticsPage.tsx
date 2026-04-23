@@ -7,7 +7,12 @@ import {
   TrendingUp,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import type { AnalyticsResponse, AnalyticsDailyEntry, AnalyticsModelEntry, AnalyticsSkillEntry } from "@/lib/api";
+import type {
+  AnalyticsDailyEntry,
+  AnalyticsModelEntry,
+  AnalyticsSkillEntry,
+  NormalizedAnalyticsResponse,
+} from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -277,7 +282,7 @@ function SkillTable({ skills }: { skills: AnalyticsSkillEntry[] }) {
 
 export default function AnalyticsPage() {
   const [days, setDays] = useState(30);
-  const [data, setData] = useState<AnalyticsResponse | null>(null);
+  const [data, setData] = useState<NormalizedAnalyticsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const { t } = useI18n();

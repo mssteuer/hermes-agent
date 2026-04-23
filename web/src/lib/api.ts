@@ -52,8 +52,8 @@ export const api = {
     if (params.component && params.component !== "all") qs.set("component", params.component);
     return fetchJSON<LogsResponse>(`/api/logs?${qs.toString()}`);
   },
-  getAnalytics: (days: number) =>
-    fetchJSON<AnalyticsResponse>(`/api/analytics/usage?days=${days}`),
+  getAnalytics: (days: number): Promise<NormalizedAnalyticsResponse> =>
+    fetchJSON<AnalyticsResponse>(`/api/analytics/usage?days=${days}`).then(normalizeAnalyticsResponse),
   getConfig: () => fetchJSON<Record<string, unknown>>("/api/config"),
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
   getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),
@@ -355,9 +355,31 @@ export interface AnalyticsResponse {
     total_sessions: number;
     total_api_calls: number;
   };
+  skills?: {
+    summary?: AnalyticsSkillsSummary;
+    top_skills?: AnalyticsSkillEntry[];
+  };
+}
+
+export type NormalizedAnalyticsResponse = Omit<AnalyticsResponse, "skills"> & {
   skills: {
     summary: AnalyticsSkillsSummary;
     top_skills: AnalyticsSkillEntry[];
+  };
+};
+
+export function normalizeAnalyticsResponse(raw: AnalyticsResponse): NormalizedAnalyticsResponse {
+  return {
+    ...raw,
+    skills: {
+      summary: {
+        total_skill_loads: raw.skills?.summary?.total_skill_loads ?? 0,
+        total_skill_edits: raw.skills?.summary?.total_skill_edits ?? 0,
+        total_skill_actions: raw.skills?.summary?.total_skill_actions ?? 0,
+        distinct_skills_used: raw.skills?.summary?.distinct_skills_used ?? 0,
+      },
+      top_skills: Array.isArray(raw.skills?.top_skills) ? raw.skills.top_skills : [],
+    },
   };
 }
 
