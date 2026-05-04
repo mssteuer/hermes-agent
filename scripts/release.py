@@ -69,6 +69,7 @@ AUTHOR_MAP = {
     "nbot@liizfq.top": "liizfq",
     "274096618+hermes-agent-dhabibi@users.noreply.github.com": "dhabibi",
     "dejie.guo@gmail.com": "JayGwod",
+    "msteuer@gmail.com": "mssteuer",
     "133716830+0xKingBack@users.noreply.github.com": "0xKingBack",
     "daixin1204@gmail.com": "SimbaKingjoe",
     "maxence@groine.fr": "MaxyMoos",
