@@ -804,6 +804,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        model_override: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -812,6 +813,13 @@ class APIServerAdapter(BasePlatformAdapter):
         base_url, etc. from config.yaml / env vars.  Toolsets are resolved
         from config.yaml platform_toolsets.api_server (same as all other
         gateway platforms), falling back to the hermes-api-server default.
+
+        If *model_override* is provided (e.g. from the request body's
+        ``model`` field), it takes precedence over the gateway default.
+        When the override contains a provider prefix (e.g.
+        ``openrouter/openai/gpt-5.5``), the provider and base_url are
+        resolved from config.yaml so the agent routes to the correct
+        backend.
 
         ``gateway_session_key`` is a stable per-channel identifier supplied
         by the client (via ``X-Hermes-Session-Key``).  Unlike ``session_id``
@@ -836,6 +844,26 @@ class APIServerAdapter(BasePlatformAdapter):
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
+
+        # Apply model override from request body if provided.
+        # This allows API consumers (CCC, external UIs) to select a model
+        # per-request rather than always using the gateway default.
+        if model_override:
+            model = model_override
+            _override_lower = model_override.lower()
+            providers_cfg = user_config.get("providers", {})
+            if _override_lower.startswith("openrouter/"):
+                or_cfg = providers_cfg.get("openrouter", {})
+                runtime_kwargs["provider"] = "openrouter"
+                if or_cfg.get("api_key"):
+                    runtime_kwargs["api_key"] = or_cfg["api_key"]
+                if or_cfg.get("base_url"):
+                    runtime_kwargs["base_url"] = or_cfg["base_url"]
+                elif not runtime_kwargs.get("base_url"):
+                    runtime_kwargs["base_url"] = "https://openrouter.ai/api/v1"
+            elif _override_lower.startswith("litellm-") or _override_lower.startswith("litellm/"):
+                runtime_kwargs["provider"] = "custom"
+                runtime_kwargs["base_url"] = "http://localhost:4000"
 
         agent = AIAgent(
             model=model,
@@ -1085,6 +1113,12 @@ class APIServerAdapter(BasePlatformAdapter):
         model_name = body.get("model", self._model_name)
         created = int(time.time())
 
+        # Derive model override: use body.model if it differs from the
+        # gateway's advertised model name (which is just an alias).
+        _chat_model_override = body.get("model") or None
+        if _chat_model_override == self._model_name:
+            _chat_model_override = None
+
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
@@ -1167,6 +1201,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                model_override=_chat_model_override,
             ))
 
             return await self._write_sse_chat_completion(
@@ -1183,6 +1218,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                model_override=_chat_model_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2143,6 +2179,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
 
+        # Derive model override for responses API
+        _resp_model_override = body.get("model") or None
+        if _resp_model_override == self._model_name:
+            _resp_model_override = None
+
         stream = bool(body.get("stream", False))
         if stream:
             # Streaming branch — emit OpenAI Responses SSE events as the
@@ -2196,6 +2237,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                model_override=_resp_model_override,
             ))
 
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
@@ -2226,6 +2268,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                model_override=_resp_model_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2684,6 +2727,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        model_override: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2707,6 +2751,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 gateway_session_key=gateway_session_key,
+                model_override=model_override,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
@@ -2905,6 +2950,12 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        # Extract requested model from body (may be None/empty → use gateway default)
+        requested_model = body.get("model") or None
+        # Don't treat self._model_name as an override — it's the gateway default alias
+        if requested_model == self._model_name:
+            requested_model = None
+
         self._set_run_status(
             run_id,
             "queued",
@@ -2922,6 +2973,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                     gateway_session_key=gateway_session_key,
+                    model_override=requested_model,
                 )
                 self._active_run_agents[run_id] = agent
 
