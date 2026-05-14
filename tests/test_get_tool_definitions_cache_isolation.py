@@ -87,6 +87,25 @@ class TestQuietModeCacheIsolation:
             f"baseline={baseline}, final={len(final)}."
         )
 
+    def test_cache_bounded_by_lru_eviction(self):
+        """The cache evicts the oldest entry when it reaches 8 entries,
+        keeping 7 warm entries instead of clearing everything."""
+        # Fill cache with 8 distinct keys by varying enabled_toolsets
+        toolset_names = [f"fake_toolset_{i}" for i in range(8)]
+        for name in toolset_names:
+            model_tools.get_tool_definitions(
+                enabled_toolsets=[name], quiet_mode=True,
+            )
+        assert len(model_tools._tool_defs_cache) == 8
+
+        # Adding a 9th should evict the oldest, not clear all
+        model_tools.get_tool_definitions(
+            enabled_toolsets=["fake_toolset_overflow"], quiet_mode=True,
+        )
+        assert len(model_tools._tool_defs_cache) == 8, (
+            "LRU eviction should keep the cache at 8 entries, not clear it"
+        )
+
     def test_non_quiet_mode_does_not_use_cache(self):
         """Sanity: quiet_mode=False (TUI path) skips the cache entirely \u2014
         explains why the bug only hit Gateway."""
